@@ -11,7 +11,7 @@ import torch.nn as nn
 
 from .basic_vae import Decoder, Encoder
 from .quant import VectorQuantizer2
-
+from .utils.fsq import FSQ
 
 class VQVAE(nn.Module):
     def __init__(
@@ -41,9 +41,13 @@ class VQVAE(nn.Module):
         
         self.vocab_size = vocab_size
         self.downsample = 2 ** (len(ddconfig['ch_mult'])-1)
-        self.quantize: VectorQuantizer2 = VectorQuantizer2(
-            vocab_size=vocab_size, Cvae=self.Cvae, using_znorm=using_znorm, beta=beta,
-            default_qresi_counts=default_qresi_counts, v_patch_nums=v_patch_nums, quant_resi=quant_resi, share_quant_resi=share_quant_resi,
+        # self.quantize: VectorQuantizer2 = VectorQuantizer2(
+        #     vocab_size=vocab_size, Cvae=self.Cvae, using_znorm=using_znorm, beta=beta,
+        #     default_qresi_counts=default_qresi_counts, v_patch_nums=v_patch_nums, quant_resi=quant_resi, share_quant_resi=share_quant_resi,
+        # )
+        self.fsq = FSQ(
+            levels=v_patch_nums, dim=self.Cvae, num_codebooks=1,
+            keep_num_codebooks_dim=False, scale=1.0 / self.downsample
         )
         self.quant_conv = torch.nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks//2)
         self.post_quant_conv = torch.nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks//2)
@@ -54,9 +58,10 @@ class VQVAE(nn.Module):
     
     # ===================== `forward` is only used in VAE training =====================
     def forward(self, inp, ret_usages=False):   # -> rec_B3HW, idx_N, loss
-        VectorQuantizer2.forward
-        f_hat, usages, vq_loss = self.quantize(self.quant_conv(self.encoder(inp)), ret_usages=ret_usages)
-        return self.decoder(self.post_quant_conv(f_hat)), usages, vq_loss
+        f = self.quant_conv(self.encoder(inp))  # B C H W
+        q_f, _ = self.fsq(f)
+        # f_hat, usages, vq_loss = self.quantize(self.quant_conv(self.encoder(inp)), ret_usages=ret_usages)
+        return self.decoder(self.post_quant_conv(q_f)), None, torch.tensor(0.0, device=inp.device)
     # ===================== `forward` is only used in VAE training =====================
     
     def fhat_to_img(self, f_hat: torch.Tensor):
@@ -83,11 +88,13 @@ class VQVAE(nn.Module):
     
     def img_to_reconstructed_img(self, x, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None, last_one=False) -> List[torch.Tensor]:
         f = self.quant_conv(self.encoder(x))
-        ls_f_hat_BChw = self.quantize.f_to_idxBl_or_fhat(f, to_fhat=True, v_patch_nums=v_patch_nums)
-        if last_one:
-            return self.decoder(self.post_quant_conv(ls_f_hat_BChw[-1])).clamp_(-1, 1)
-        else:
-            return [self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1) for f_hat in ls_f_hat_BChw]
+        # ls_f_hat_BChw = self.quantize.f_to_idxBl_or_fhat(f, to_fhat=True, v_patch_nums=v_patch_nums)
+        q_f, _ = self.fsq(f)
+        # if last_one:
+        #     return self.decoder(self.post_quant_conv(ls_f_hat_BChw[-1])).clamp_(-1, 1)
+        # else:
+        #     return [self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1) for f_hat in ls_f_hat_BChw]
+        return self.decoder(self.post_quant_conv(q_f)).clamp_(-1, 1)
     
     def load_state_dict(self, state_dict: Dict[str, Any], strict=True, assign=False):
         if 'quantize.ema_vocab_hit_SV' in state_dict and state_dict['quantize.ema_vocab_hit_SV'].shape[0] != self.quantize.ema_vocab_hit_SV.shape[0]:
