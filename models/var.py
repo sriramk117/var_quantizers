@@ -49,8 +49,8 @@ class VAR(nn.Module):
         self.rng = torch.Generator(device=dist.get_device())
         
         # 1. input (word) embedding
-        quant: VectorQuantizer2 = vae_local.quantize
-        fsq: VectorQuantizer2 = vae_local.fsq if isinstance(vae_local, VQVAE) else quant
+        # quant: VectorQuantizer2 = vae_local.quantize
+        fsq: VectorQuantizer2 = vae_local.fsq 
         self.vae_proxy: Tuple[VQVAE] = (vae_local,)
         self.vae_quant_proxy: Tuple[VectorQuantizer2] = (fsq,)
         self.word_embed = nn.Linear(self.Cvae, self.C)
