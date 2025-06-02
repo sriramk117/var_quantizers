@@ -11,7 +11,7 @@ import torch.nn as nn
 
 from .basic_vae import Decoder, Encoder
 from .quant import VectorQuantizer2
-from .utils.fsq import FSQ
+from utils.fsq import FSQ
 
 class VQVAE(nn.Module):
     def __init__(
@@ -44,9 +44,9 @@ class VQVAE(nn.Module):
         # self.quantize: VectorQuantizer2 = VectorQuantizer2(
         #     vocab_size=vocab_size, Cvae=self.Cvae, using_znorm=using_znorm, beta=beta,
         #     default_qresi_counts=default_qresi_counts, v_patch_nums=v_patch_nums, quant_resi=quant_resi, share_quant_resi=share_quant_resi,
-        # )
+        # ))
         self.fsq = FSQ(
-            levels=v_patch_nums, dim=self.Cvae, num_codebooks=1,
+            levels=[8] * z_channels, dim=self.Cvae, num_codebooks=1,
             keep_num_codebooks_dim=False, scale=1.0 / self.downsample
         )
         self.quant_conv = torch.nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks//2)
