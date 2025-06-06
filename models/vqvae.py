@@ -97,6 +97,7 @@ class VQVAE(nn.Module):
         return self.decoder(self.post_quant_conv(q_f)).clamp_(-1, 1)
     
     def load_state_dict(self, state_dict: Dict[str, Any], strict=True, assign=False):
-        if 'quantize.ema_vocab_hit_SV' in state_dict and state_dict['quantize.ema_vocab_hit_SV'].shape[0] != self.quantize.ema_vocab_hit_SV.shape[0]:
-            state_dict['quantize.ema_vocab_hit_SV'] = self.quantize.ema_vocab_hit_SV
+        if 'fsq.implicit_codebook' in state_dict and state_dict['fsq.implicit_codebook'].shape[0] != self.fsq.implicit_codebook.shape[0]:
+            # state_dict['quantize.ema_vocab_hit_SV'] = self.quantize.ema_vocab_hit_SV
+            state_dict['fsq.implicit_codebook'] = self.fsq.implicit_codebook
         return super().load_state_dict(state_dict=state_dict, strict=strict, assign=assign)
