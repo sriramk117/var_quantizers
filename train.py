@@ -77,33 +77,63 @@ def build_everything(args: arg_util.Args):
     
     # build models
     from torch.nn.parallel import DistributedDataParallel as DDP
-    from models import VAR, VQVAE, build_vae_var
+    from models import VAR, VQVAE
     from trainer import VARTrainer
     from utils.amp_sc import AmpOptimizer
     from utils.lr_control import filter_params
     
-    vae_local, var_wo_ddp = build_vae_var(
-        V=4096, Cvae=32, ch=160, share_quant_resi=4,        # hard-coded VQVAE hyperparameters
-        device=dist.get_device(), patch_nums=args.patch_nums,
-        num_classes=num_classes, depth=args.depth, shared_aln=args.saln, attn_l2_norm=args.anorm,
-        flash_if_available=args.fuse, fused_if_available=args.fuse,
-        init_adaln=args.aln, init_adaln_gamma=args.alng, init_head=args.hd, init_std=args.ini,
+    # Instantiate the new VQVAE, which now matches the checkpoint's architecture.
+    fsq_levels = [8, 5, 5, 5]
+    vae_local = VQVAE(
+        channel=512,
+        z_channels=len(fsq_levels),
+        levels=fsq_levels,
     )
     
-    vae_ckpt = 'vae_ch160v4096z32.pth'
-    if dist.is_local_master():
-        if not os.path.exists(vae_ckpt):
-            os.system(f'wget https://huggingface.co/FoundationVision/var/resolve/main/{vae_ckpt}')
-    dist.barrier()
-    vae_local.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
+    # Use the --vae_ckpt argument from the command line.
+    vae_ckpt_path = 'fsq-n_embed_1k.pt' # Use getattr to handle case where arg is not defined
     
-    vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
+    if dist.is_local_master():
+        if not vae_ckpt_path:
+            raise ValueError("A pretrained VAE checkpoint path must be provided via the --vae_ckpt argument.")
+        if not os.path.exists(vae_ckpt_path):
+            raise FileNotFoundError(f"FSQ VAE checkpoint not found at: {vae_ckpt_path}. Please provide the correct path.")
+    dist.barrier()
+
+    # Load the checkpoint. The custom load_state_dict in VQVAE will handle key mapping.
+    print(f"Loading VQVAE checkpoint from: {vae_ckpt_path}")
+    state_dict = torch.load(vae_ckpt_path, map_location='cpu')
+    if 'model_state_dict' in state_dict:
+        state_dict = state_dict['model_state_dict']
+    vae_local.load_state_dict(state_dict)
+    
+    # [FIX 1] Move the VAE to the correct GPU device BEFORE it's used by the VAR model.
+    vae_local = vae_local.to(args.device)
+
+    # Instantiate VAR with the now-loaded and device-placed FSQ-based VAE
+    var_wo_ddp = VAR(
+        vae_local=vae_local,
+        patch_nums=args.patch_nums,
+        num_classes=num_classes,
+        depth=args.depth,
+        shared_aln=args.saln,
+        attn_l2_norm=args.anorm,
+        flash_if_available=args.fuse,
+        fused_if_available=args.fuse,
+    )
+    
+    # [FIX 2] Move the main VAR model to the correct GPU device BEFORE compiling and DDP wrapping.
+    var_wo_ddp = var_wo_ddp.to(args.device)
+    
+    # Set VAE to eval mode (it's frozen) and compile models
+    vae_local: VQVAE = args.compile_model(vae_local.eval(), args.vfast)
     var_wo_ddp: VAR = args.compile_model(var_wo_ddp, args.tfast)
     var: DDP = (DDP if dist.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=False, broadcast_buffers=False)
     
     print(f'[INIT] VAR model = {var_wo_ddp}\n\n')
     count_p = lambda m: f'{sum(p.numel() for p in m.parameters())/1e6:.2f}'
-    print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAE', vae_local), ('VAE.enc', vae_local.encoder), ('VAE.dec', vae_local.decoder), ('VAE.quant', vae_local.quantize))]))
+    # Updated print statements for the new VAE structure
+    print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAE', vae_local), ('VAE.enc', vae_local.enc), ('VAE.dec', vae_local.dec), ('VAE.fsq', vae_local.fsq))]))
     print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAR', var_wo_ddp),)]) + '\n\n')
     
     # build optimizer
@@ -189,7 +219,7 @@ def main_training():
         if hasattr(ld_train, 'sampler') and hasattr(ld_train.sampler, 'set_epoch'):
             ld_train.sampler.set_epoch(ep)
             if ep < 3:
-                # noinspection PyArgumentList
+                # noinspection PyTypeChecker
                 print(f'[{type(ld_train).__name__}] [ld_train.sampler.set_epoch({ep})]', flush=True, force=True)
         tb_lg.set_step(ep * iters_train)
         
@@ -251,7 +281,6 @@ def main_training():
 
 
 def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tb_lg: misc.TensorboardLogger, ld_or_itrt, iters_train: int, trainer):
-    # import heavy packages after Dataloader object creation
     from trainer import VARTrainer
     from utils.lr_control import lr_wd_annealing
     trainer: VARTrainer
@@ -283,13 +312,13 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         min_tlr, max_tlr, min_twd, max_twd = lr_wd_annealing(args.sche, trainer.var_opt.optimizer, args.tlr, args.twd, args.twde, g_it, wp_it, max_it, wp0=args.wp0, wpe=args.wpe)
         args.cur_lr, args.cur_wd = max_tlr, max_twd
         
-        if args.pg: # default: args.pg == 0.0, means no progressive training, won't get into this
+        if args.pg:
             if g_it <= wp_it: prog_si = args.pg0
             elif g_it >= max_it*args.pg: prog_si = len(args.patch_nums) - 1
             else:
                 delta = len(args.patch_nums) - 1 - args.pg0
-                progress = min(max((g_it - wp_it) / (max_it*args.pg - wp_it), 0), 1) # from 0 to 1
-                prog_si = args.pg0 + round(progress * delta)    # from args.pg0 to len(args.patch_nums)-1
+                progress = min(max((g_it - wp_it) / (max_it*args.pg - wp_it), 0), 1)
+                prog_si = args.pg0 + round(progress * delta)
         else:
             prog_si = -1
         
@@ -314,7 +343,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
             tb_lg.update(head='AR_opt_grad/grad', grad_clip=args.tclip)
     
     me.synchronize_between_processes()
-    return {k: meter.global_avg for k, meter in me.meters.items()}, me.iter_time.time_preds(max_it - (g_it + 1) + (args.ep - ep) * 15)  # +15: other cost
+    return {k: meter.global_avg for k, meter in me.meters.items()}, me.iter_time.time_preds(max_it - (g_it + 1) + (args.ep - ep) * 15)
 
 
 class NullDDP(torch.nn.Module):

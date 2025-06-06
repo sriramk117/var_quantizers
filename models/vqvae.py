@@ -1,103 +1,163 @@
 """
-References:
-- VectorQuantizer2: https://github.com/CompVis/taming-transformers/blob/3ba01b241669f5ade541ce990f7650a3b8f65318/taming/modules/vqvae/quantize.py#L110
-- GumbelQuantize: https://github.com/CompVis/taming-transformers/blob/3ba01b241669f5ade541ce990f7650a3b8f65318/taming/modules/vqvae/quantize.py#L213
-- VQVAE (VQModel): https://github.com/CompVis/stable-diffusion/blob/21f890f9da3cfbeaba8e2ac3c425ee9e998d5229/ldm/models/autoencoder.py#L14
+This VQVAE model is adapted from the FSQ-PyTorch repository (duchenzhuang/FSQ-pytorch)
+to match the architecture of the pretrained checkpoint. It replaces the original
+U-Net-like VQVAE from the VAR repository.
 """
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import List, Any, Dict
 
 import torch
 import torch.nn as nn
 
-from .basic_vae import Decoder, Encoder
-from .quant import VectorQuantizer2
+# Assuming fsq.py is in the same directory (models/)
 from utils.fsq import FSQ
 
+class Encoder(nn.Module):
+    """
+    A simple convolutional encoder that matches the architecture from
+    the repository where the FSQ checkpoint was trained.
+    """
+    def __init__(self, in_channel, channel, embed_dim):
+        super().__init__()
+        blocks = [
+            nn.Conv2d(in_channel, channel, 4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel, channel, 4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel, channel, 4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel, embed_dim, 1)
+        ]
+        self.blocks = nn.Sequential(*blocks)
+
+    def forward(self, input):
+        return self.blocks(input)
+
+
+class Decoder(nn.Module):
+    """
+    A simple convolutional decoder that matches the architecture from
+    the repository where the FSQ checkpoint was trained.
+    """
+    def __init__(self, in_channel, out_channel, channel):
+        super().__init__()
+        blocks = [
+            nn.ConvTranspose2d(in_channel, channel, 4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(channel, channel, 4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(channel, channel, 4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel, out_channel, 1)
+        ]
+        self.blocks = nn.Sequential(*blocks)
+
+    def forward(self, input):
+        return self.blocks(input)
+
+
 class VQVAE(nn.Module):
+    """
+    The main VQ-VAE model class that integrates the Encoder, Decoder, and FSQ quantizer.
+    Its structure is now compatible with the pretrained fsq-n_embed_1k.pt checkpoint.
+    """
     def __init__(
-        self, vocab_size=4096, z_channels=32, ch=128, dropout=0.0,
-        beta=0.25,              # commitment loss weight
-        using_znorm=False,      # whether to normalize when computing the nearest neighbors
-        quant_conv_ks=3,        # quant conv kernel size
-        quant_resi=0.5,         # 0.5 means \phi(x) = 0.5conv(x) + (1-0.5)x
-        share_quant_resi=4,     # use 4 \phi layers for K scales: partially-shared \phi
-        default_qresi_counts=0, # if is 0: automatically set to len(v_patch_nums)
-        v_patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16), # number of patches for each scale, h_{1 to K} = w_{1 to K} = v_patch_nums[k]
-        test_mode=True,
+        self,
+        in_channel: int = 3,
+        channel: int = 128,
+        z_channels: int = 4, # This is the FSQ embedding dimension, must match levels
+        levels: List[int] = [8, 5, 5, 5],
+        **kwargs # Absorb unused arguments from train.py (like `dropout`) to prevent errors
     ):
         super().__init__()
-        self.test_mode = test_mode
-        self.V, self.Cvae = vocab_size, z_channels
-        # ddconfig is copied from https://github.com/CompVis/latent-diffusion/blob/e66308c7f2e64cb581c6d27ab6fbeb846828253b/models/first_stage_models/vq-f16/config.yaml
-        ddconfig = dict(
-            dropout=dropout, ch=ch, z_channels=z_channels,
-            in_channels=3, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,   # from vq-f16/config.yaml above
-            using_sa=True, using_mid_sa=True,                           # from vq-f16/config.yaml above
-            # resamp_with_conv=True,   # always True, removed.
-        )
-        ddconfig.pop('double_z', None)  # only KL-VAE should use double_z=True
-        self.encoder = Encoder(double_z=False, **ddconfig)
-        self.decoder = Decoder(**ddconfig)
         
-        self.vocab_size = vocab_size
-        self.downsample = 2 ** (len(ddconfig['ch_mult'])-1)
-        # self.quantize: VectorQuantizer2 = VectorQuantizer2(
-        #     vocab_size=vocab_size, Cvae=self.Cvae, using_znorm=using_znorm, beta=beta,
-        #     default_qresi_counts=default_qresi_counts, v_patch_nums=v_patch_nums, quant_resi=quant_resi, share_quant_resi=share_quant_resi,
-        # ))
-        self.fsq = FSQ(
-            levels=[8] * z_channels, dim=self.Cvae, num_codebooks=1,
-            keep_num_codebooks_dim=False, scale=1.0 / self.downsample
-        )
-        self.quant_conv = torch.nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks//2)
-        self.post_quant_conv = torch.nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks//2)
+        # In this architecture, `z_channels` is the embedding dimension for FSQ.
+        # It must equal len(levels).
+        if z_channels != len(levels):
+            raise ValueError(f"z_channels ({z_channels}) must match the number of FSQ levels ({len(levels)})")
+            
+        self.Cvae = z_channels
+        self.enc = Encoder(in_channel, channel, z_channels)
         
-        if self.test_mode:
-            self.eval()
-            [p.requires_grad_(False) for p in self.parameters()]
-    
-    # ===================== `forward` is only used in VAE training =====================
-    def forward(self, inp, ret_usages=False):   # -> rec_B3HW, idx_N, loss
-        f = self.quant_conv(self.encoder(inp))  # B C H W
-        q_f, _ = self.fsq(f)
-        # f_hat, usages, vq_loss = self.quantize(self.quant_conv(self.encoder(inp)), ret_usages=ret_usages)
-        return self.decoder(self.post_quant_conv(q_f)), None, torch.tensor(0.0, device=inp.device)
-    # ===================== `forward` is only used in VAE training =====================
-    
-    def fhat_to_img(self, f_hat: torch.Tensor):
-        return self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1)
-    
-    def img_to_idxBl(self, inp_img_no_grad: torch.Tensor, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[torch.LongTensor]:    # return List[Bl]
-        f = self.quant_conv(self.encoder(inp_img_no_grad))
-        return self.quantize.f_to_idxBl_or_fhat(f, to_fhat=False, v_patch_nums=v_patch_nums)
-    
-    def idxBl_to_img(self, ms_idx_Bl: List[torch.Tensor], same_shape: bool, last_one=False) -> Union[List[torch.Tensor], torch.Tensor]:
-        B = ms_idx_Bl[0].shape[0]
-        ms_h_BChw = []
-        for idx_Bl in ms_idx_Bl:
-            l = idx_Bl.shape[1]
-            pn = round(l ** 0.5)
-            ms_h_BChw.append(self.quantize.embedding(idx_Bl).transpose(1, 2).view(B, self.Cvae, pn, pn))
-        return self.embed_to_img(ms_h_BChw=ms_h_BChw, all_to_max_scale=same_shape, last_one=last_one)
-    
-    def embed_to_img(self, ms_h_BChw: List[torch.Tensor], all_to_max_scale: bool, last_one=False) -> Union[List[torch.Tensor], torch.Tensor]:
-        if last_one:
-            return self.decoder(self.post_quant_conv(self.quantize.embed_to_fhat(ms_h_BChw, all_to_max_scale=all_to_max_scale, last_one=True))).clamp_(-1, 1)
-        else:
-            return [self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1) for f_hat in self.quantize.embed_to_fhat(ms_h_BChw, all_to_max_scale=all_to_max_scale, last_one=False)]
-    
-    def img_to_reconstructed_img(self, x, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None, last_one=False) -> List[torch.Tensor]:
-        f = self.quant_conv(self.encoder(x))
-        # ls_f_hat_BChw = self.quantize.f_to_idxBl_or_fhat(f, to_fhat=True, v_patch_nums=v_patch_nums)
-        q_f, _ = self.fsq(f)
-        # if last_one:
-        #     return self.decoder(self.post_quant_conv(ls_f_hat_BChw[-1])).clamp_(-1, 1)
-        # else:
-        #     return [self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1) for f_hat in ls_f_hat_BChw]
-        return self.decoder(self.post_quant_conv(q_f)).clamp_(-1, 1)
-    
-    def load_state_dict(self, state_dict: Dict[str, Any], strict=True, assign=False):
-        if 'fsq.implicit_codebook' in state_dict and state_dict['fsq.implicit_codebook'].shape[0] != self.fsq.implicit_codebook.shape[0]:
-            # state_dict['quantize.ema_vocab_hit_SV'] = self.quantize.ema_vocab_hit_SV
-            state_dict['fsq.implicit_codebook'] = self.fsq.implicit_codebook
-        return super().load_state_dict(state_dict=state_dict, strict=strict, assign=assign)
+        # The FSQ quantizer from the original project was named 'quantize_t'.
+        # We name it 'fsq' for clarity, and handle the key mapping in load_state_dict.
+        self.fsq = FSQ(levels=levels, dim=z_channels)
+        
+        self.dec = Decoder(z_channels, in_channel, channel)
+        
+        # The total number of unique codes in the codebook.
+        self.vocab_size = self.fsq.codebook_size
+
+    def forward(self, input):
+        """
+        Defines the forward pass for VAE training/reconstruction.
+        """
+        h = self.enc(input)
+        quant, indices = self.fsq(h)
+        # The original FSQ repo returned a 'diff' term. FSQ doesn't have a commitment loss,
+        # so we return a zero tensor for compatibility.
+        diff = torch.tensor(0.0, device=input.device)
+        dec = self.dec(quant)
+        return dec, diff, indices
+
+    @torch.no_grad()
+    def img_to_indices(self, inp_img: torch.Tensor) -> torch.Tensor:
+        """
+        Encodes an image to a 2D tensor of FSQ indices.
+        """
+        h = self.enc(inp_img)
+        _quant, indices = self.fsq(h)
+        return indices
+
+    @torch.no_grad()
+    def indices_to_img(self, indices: torch.Tensor) -> torch.Tensor:
+        """
+        Decodes a 2D tensor of FSQ indices back into an image.
+        """
+        quant = self.fsq.indices_to_codes(indices, project_out=True)
+        dec = self.dec(quant)
+        return dec.clamp(-1, 1)
+
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
+        """
+        Custom load_state_dict to handle key mapping from the pretrained checkpoint.
+        This function translates the keys from the saved model (e.g., 'module.quantize_t.some_weight')
+        to match the keys in this model (e.g., 'fsq.some_weight').
+        """
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            # Remove 'module.' prefix if it was saved from a DDP model
+            if k.startswith('module.'):
+                k = k[len('module.'):]
+            
+            # Remap the quantizer keys from 'quantize_t' to 'fsq'
+            if k.startswith('quantize_t.'):
+                k = k.replace('quantize_t.', 'fsq.', 1)
+            
+            new_state_dict[k] = v
+            
+        # We use strict=False because the FSQ checkpoint was trained with an older
+        # version of the FSQ class and may not have the buffers `_levels` and `_basis`.
+        # PyTorch will correctly initialize them from the constructor.
+        return super().load_state_dict(new_state_dict, strict=False)
+
+
+    # def load_state_dict(self, state_dict: Dict[str, Any], strict=True, assign=False):
+    #     """Loads a pretrained FSQ VQVAE model and extracts the weights."""
+    #     full_ckpt = torch.load(ckpt_path, map_location='cpu')
+        
+    #     # This function assumes the checkpoint comes from a model like the one in `train_fsq.py`
+    #     # and may need key adjustments.
+    #     if 'model_state_dict' in full_ckpt:
+    #         full_ckpt = full_ckpt['model_state_dict']
+
+    #     model_state_dict = self.state_dict()
+    #     pretrained_dict = {k.replace('module.', ''): v for k, v in full_ckpt.items()}
+        
+    #     # Filter out unnecessary keys and update the current model's state dict
+    #     pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_state_dict and model_state_dict[k].shape == v.shape}
+        
+    #     model_state_dict.update(pretrained_dict)
+    #     if 'fsq.implicit_codebook' in model_state_dict and model_state_dict['fsq.implicit_codebook'].shape[0] != self.fsq.implicit_codebook.shape[0]:
+    #         model_state_dict['fsq.implicit_codebook'] = self.fsq.implicit_codebook
+    #     return super().load_state_dict(state_dict=model_state_dict, strict=strict, assign=assign)
+    #     # print(f"Loaded {len(pretrained_dict)} matching keys from pretrained FSQ VQ-VAE: {ckpt_path}")

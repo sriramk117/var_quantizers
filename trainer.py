@@ -7,7 +7,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 import dist
-from models import VAR, VQVAE, VectorQuantizer2
+from models import VAR, VQVAE
+# [MODIFIED] Import FSQ for type hinting
+from utils.fsq import FSQ
 from utils.amp_sc import AmpOptimizer
 from utils.misc import MetricLogger, TensorboardLogger
 
@@ -25,8 +27,10 @@ class VARTrainer(object):
     ):
         super(VARTrainer, self).__init__()
         
-        self.var, self.vae_local, self.quantize_local = var, vae_local, vae_local.quantize
-        self.quantize_local: VectorQuantizer2
+        # [FIXED] The VQVAE object has an attribute 'fsq', not 'quantize'.
+        self.var, self.vae_local, self.quantize_local = var, vae_local, vae_local.fsq
+        # [FIXED] Update the type hint for clarity.
+        self.quantize_local: FSQ
         self.var_wo_ddp: VAR = var_wo_ddp  # after torch.compile
         self.var_opt = var_opt
         
@@ -63,10 +67,19 @@ class VARTrainer(object):
             inp_B3HW = inp_B3HW.to(dist.get_device(), non_blocking=True)
             label_B = label_B.to(dist.get_device(), non_blocking=True)
             
-            gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
-            gt_BL = torch.cat(gt_idx_Bl, dim=1)
-            x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+            # [FIXED] New data preparation logic for FSQ.
+            # Get quantized vectors and ground-truth indices directly.
+            h = self.vae_local.enc(inp_B3HW)
+            quant, gt_BL = self.vae_local.fsq(h)
             
+            # Reshape quantized vectors for VAR input.
+            B, C_vae, H, W = quant.shape
+            quant_BLC = quant.permute(0, 2, 3, 1).reshape(B, H * W, C_vae)
+            
+            # The VAR model expects teacher-forcing inputs for tokens after the initial patch.
+            first_l = self.var_wo_ddp.first_l
+            x_BLCv_wo_first_l = quant_BLC[:, :self.L - first_l]
+
             self.var_wo_ddp.forward
             logits_BLV = self.var_wo_ddp(label_B, x_BLCv_wo_first_l)
             L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
@@ -88,34 +101,42 @@ class VARTrainer(object):
         inp_B3HW: FTen, label_B: Union[ITen, FTen], prog_si: int, prog_wp_it: float,
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
         # if progressive training
-        self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = prog_si
+        self.var_wo_ddp.prog_si = prog_si
+        # [FIXED] The new FSQ VAE doesn't have a prog_si attribute.
+        # self.vae_local.quantize.prog_si = prog_si
         if self.last_prog_si != prog_si:
             if self.last_prog_si != -1: self.first_prog = False
             self.last_prog_si = prog_si
             self.prog_it = 0
         self.prog_it += 1
         prog_wp = max(min(self.prog_it / prog_wp_it, 1), 0.01)
-        if self.first_prog: prog_wp = 1    # no prog warmup at first prog stage, as it's already solved in wp
-        if prog_si == len(self.patch_nums) - 1: prog_si = -1    # max prog, as if no prog
+        if self.first_prog: prog_wp = 1
+        if prog_si == len(self.patch_nums) - 1: prog_si = -1
         
         # forward
         B, V = label_B.shape[0], self.vae_local.vocab_size
         self.var.require_backward_grad_sync = stepping
         
-        gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
-        gt_BL = torch.cat(gt_idx_Bl, dim=1)
-        x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+        # [FIXED] New data preparation logic for FSQ.
+        h = self.vae_local.enc(inp_B3HW)
+        quant, gt_BL = self.vae_local.fsq(h)
         
+        B, C_vae, H, W = quant.shape
+        quant_BLC = quant.permute(0, 2, 3, 1).reshape(B, H * W, C_vae)
+        
+        first_l = self.var_wo_ddp.first_l
+        x_BLCv_wo_first_l = quant_BLC[:, :self.L - first_l]
+
         with self.var_opt.amp_ctx:
             self.var_wo_ddp.forward
             logits_BLV = self.var(label_B, x_BLCv_wo_first_l)
             loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
-            if prog_si >= 0:    # in progressive training
+            if prog_si >= 0:
                 bg, ed = self.begin_ends[prog_si]
                 assert logits_BLV.shape[1] == gt_BL.shape[1] == ed
                 lw = self.loss_weight[:, :ed].clone()
                 lw[:, bg:ed] *= min(max(prog_wp, 0), 1)
-            else:               # not in progressive training
+            else:
                 lw = self.loss_weight
             loss = loss.mul(lw).sum(dim=-1).mean()
         
@@ -127,9 +148,9 @@ class VARTrainer(object):
         if it == 0 or it in metric_lg.log_iters:
             Lmean = self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)).item()
             acc_mean = (pred_BL == gt_BL).float().mean().item() * 100
-            if prog_si >= 0:    # in progressive training
+            if prog_si >= 0:
                 Ltail = acc_tail = -1
-            else:               # not in progressive training
+            else:
                 Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)).item()
                 acc_tail = (pred_BL[:, -self.last_l:] == gt_BL[:, -self.last_l:]).float().mean().item() * 100
             grad_norm = grad_norm.item()
@@ -156,7 +177,7 @@ class VARTrainer(object):
                 tb_lg.update(head='AR_iter_loss', **kw, step=g_it)
                 tb_lg.update(head='AR_iter_schedule', prog_a_reso=self.resos[prog_si], prog_si=prog_si, prog_wp=prog_wp, step=g_it)
         
-        self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = -1
+        self.var_wo_ddp.prog_si = -1
         return grad_norm, scale_log2
     
     def get_config(self):
