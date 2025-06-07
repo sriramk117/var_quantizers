@@ -83,7 +83,7 @@ def build_everything(args: arg_util.Args):
     from utils.lr_control import filter_params
     
     # Instantiate the new VQVAE, which now matches the checkpoint's architecture.
-    fsq_levels = [8, 5, 5, 5]
+    fsq_levels = [8, 8, 8, 6, 5]
     vae_local = VQVAE(
         channel=512,
         z_channels=len(fsq_levels),
@@ -91,7 +91,7 @@ def build_everything(args: arg_util.Args):
     )
     
     # Use the --vae_ckpt argument from the command line.
-    vae_ckpt_path = 'fsq-n_embed_1k.pt' # Use getattr to handle case where arg is not defined
+    vae_ckpt_path = 'fsq-n_embed_16k.pt' # Use getattr to handle case where arg is not defined
     
     if dist.is_local_master():
         if not vae_ckpt_path:

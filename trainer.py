@@ -64,8 +64,8 @@ class VARTrainer(object):
         self.var_wo_ddp.eval()
         for inp_B3HW, label_B in ld_val:
             B, V = label_B.shape[0], self.vae_local.vocab_size
-            #print(f"label B shape: {B}")
-            #print(f"Vocab size: {V}")
+            print(f"label B shape: {B}")
+            print(f"Vocab size: {V}")
             inp_B3HW = inp_B3HW.to(dist.get_device(), non_blocking=True)
             label_B = label_B.to(dist.get_device(), non_blocking=True)
             
