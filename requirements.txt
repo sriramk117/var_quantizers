@@ -2,8 +2,9 @@ torch~=2.1.0
 
 Pillow
 huggingface_hub
-numpy
+numpy<2.0
 pytz
 transformers
 typed-argument-parser
 tensorboard
+einops

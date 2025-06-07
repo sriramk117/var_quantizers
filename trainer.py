@@ -64,24 +64,26 @@ class VARTrainer(object):
         self.var_wo_ddp.eval()
         for inp_B3HW, label_B in ld_val:
             B, V = label_B.shape[0], self.vae_local.vocab_size
+            print(f"label B shape: {B}")
+            print(f"Vocab size: {V}")
             inp_B3HW = inp_B3HW.to(dist.get_device(), non_blocking=True)
             label_B = label_B.to(dist.get_device(), non_blocking=True)
             
-            # [FIXED] New data preparation logic for FSQ.
-            # Get quantized vectors and ground-truth indices directly.
-            h = self.vae_local.enc(inp_B3HW)
-            quant, gt_BL = self.vae_local.fsq(h)
+            # [NEW] Multi-scale tokenization using FSQ
+            gt_idx_Bl: List[torch.Tensor] = self.vae_local.img_to_idxBl(inp_B3HW, self.patch_nums)
+            gt_BL = torch.cat(gt_idx_Bl, dim=1)
             
-            # Reshape quantized vectors for VAR input.
+            # Create teacher-forcing input for VAR
+            h = self.vae_local.enc(inp_B3HW)
+            quant, _ = self.vae_local.fsq(h)
             B, C_vae, H, W = quant.shape
             quant_BLC = quant.permute(0, 2, 3, 1).reshape(B, H * W, C_vae)
             
-            # The VAR model expects teacher-forcing inputs for tokens after the initial patch.
             first_l = self.var_wo_ddp.first_l
             x_BLCv_wo_first_l = quant_BLC[:, :self.L - first_l]
 
-            self.var_wo_ddp.forward
             logits_BLV = self.var_wo_ddp(label_B, x_BLCv_wo_first_l)
+            print(f"Logits shape: {logits_BLV.shape}")
             L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
             L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)) * B
             acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL).sum() * (100/gt_BL.shape[1])
@@ -113,23 +115,41 @@ class VARTrainer(object):
         if self.first_prog: prog_wp = 1
         if prog_si == len(self.patch_nums) - 1: prog_si = -1
         
+        # # forward
+        # B, V = label_B.shape[0], self.vae_local.vocab_size
+        # self.var.require_backward_grad_sync = stepping
+        
+        # # [FIXED] New data preparation logic for FSQ.
+        # h = self.vae_local.enc(inp_B3HW)
+        # quant, gt_BL = self.vae_local.fsq(h)
+        
+        # B, C_vae, H, W = quant.shape
+        # quant_BLC = quant.permute(0, 2, 3, 1).reshape(B, H * W, C_vae)
+        
+        # first_l = self.var_wo_ddp.first_l
+        # x_BLCv_wo_first_l = quant_BLC[:, :self.L - first_l]
+
         # forward
         B, V = label_B.shape[0], self.vae_local.vocab_size
         self.var.require_backward_grad_sync = stepping
-        
-        # [FIXED] New data preparation logic for FSQ.
+
+        # Use new FSQ multi-scale tokenization method
+        gt_idx_Bl: List[torch.Tensor] = self.vae_local.img_to_idxBl(inp_B3HW, self.patch_nums)
+        gt_BL = torch.cat(gt_idx_Bl, dim=1)
+
+        # Still need to encode the image to get quantized features for VAR input
         h = self.vae_local.enc(inp_B3HW)
-        quant, gt_BL = self.vae_local.fsq(h)
-        
+        quant, _ = self.vae_local.fsq(h)
         B, C_vae, H, W = quant.shape
         quant_BLC = quant.permute(0, 2, 3, 1).reshape(B, H * W, C_vae)
-        
+
         first_l = self.var_wo_ddp.first_l
         x_BLCv_wo_first_l = quant_BLC[:, :self.L - first_l]
 
         with self.var_opt.amp_ctx:
-            self.var_wo_ddp.forward
             logits_BLV = self.var(label_B, x_BLCv_wo_first_l)
+            #print(f"Logits shape: {logits_BLV.shape}")
+            #print(f"GT shape: {gt_BL.shape}")
             loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
             if prog_si >= 0:
                 bg, ed = self.begin_ends[prog_si]

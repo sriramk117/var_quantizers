@@ -3,7 +3,7 @@ This VQVAE model is adapted from the FSQ-PyTorch repository (duchenzhuang/FSQ-py
 to match the architecture of the pretrained checkpoint. It replaces the original
 U-Net-like VQVAE from the VAR repository.
 """
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Optional, Tuple, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -100,6 +100,69 @@ class VQVAE(nn.Module):
         return dec, diff, indices
 
     @torch.no_grad()
+    def img_to_idxBl(self, inp_img: torch.Tensor, patch_nums: Optional[Tuple[int, ...]] = None) -> List[torch.Tensor]:
+        """
+        FSQ equivalent of VAR's img_to_idxBl method.
+        Creates multi-scale token sequences like the original VQ-VAE.
+        
+        Args:
+            inp_img: Input image [B, 3, H, W]
+            patch_nums: Patch numbers for each scale (e.g., (1, 2, 3, 4, 5, 6, 8, 10, 13, 16))
+        
+        Returns:
+            List of token tensors [B, patch_num**2] for each scale
+        """
+        if patch_nums is None:
+            patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)  # Default VAR patch numbers
+        
+        h = self.enc(inp_img)  # [B, C, H, W]
+        B, C, H, W = h.shape
+        
+        # This simulates the multi-scale quantization process that VQ-VAE does
+        # We'll create a residual-like process for FSQ
+        f_rest = h.clone()  # Start with the encoded features
+        token_maps = []
+        
+        for i, patch_num in enumerate(patch_nums):
+            # Downsample the remaining features to current patch size
+            if patch_num != H:
+                f_current = torch.nn.functional.interpolate(
+                    f_rest, size=(patch_num, patch_num), mode='area'
+                )
+            else:
+                f_current = f_rest
+            
+            # Quantize at current resolution
+            quant_current, indices_current = self.fsq(f_current)
+            
+            # FSQ returns indices with shape [B, H, W] - already packed indices
+            # Convert to long dtype for CrossEntropyLoss compatibility
+            B_curr, H_curr, W_curr = indices_current.shape
+            packed_indices = indices_current.long().reshape(B_curr, H_curr * W_curr)
+            
+            token_maps.append(packed_indices)
+            
+            # Update residual (subtract the upsampled quantized version)
+            if i < len(patch_nums) - 1:  # Not the last scale
+                if patch_num != H:
+                    quant_upsampled = torch.nn.functional.interpolate(
+                        quant_current, size=(H, W), mode='bicubic'
+                    )
+                else:
+                    quant_upsampled = quant_current
+                f_rest = f_rest - quant_upsampled
+        
+        return token_maps
+
+    @torch.no_grad()
+    def fsq_gt_idx_Bl(self, inp_img: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Wrapper for img_to_idxBl to maintain backward compatibility.
+        Returns the same multi-scale token maps but with the original method name.
+        """
+        return self.img_to_idxBl(inp_img)
+
+    @torch.no_grad()
     def img_to_indices(self, inp_img: torch.Tensor) -> torch.Tensor:
         """
         Encodes an image to a 2D tensor of FSQ indices.
@@ -116,6 +179,39 @@ class VQVAE(nn.Module):
         quant = self.fsq.indices_to_codes(indices, project_out=True)
         dec = self.dec(quant)
         return dec.clamp(-1, 1)
+
+    @torch.no_grad()
+    def idxBl_to_var_input(self, gt_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Convert token indices back to continuous features for VAR input.
+        This is used for teacher forcing in VAR training.
+        
+        Args:
+            gt_idx_Bl: List of token tensors [B, patch_num**2] for each scale
+        
+        Returns:
+            Continuous features [B, L, C] for VAR input
+        """
+        # For FSQ, the indices are already packed, so we need to convert them back 
+        # to the spatial format that FSQ expects for indices_to_codes
+        B = gt_idx_Bl[0].shape[0]
+        device = gt_idx_Bl[0].device
+        
+        # Use the finest scale (last scale) which has the most detail
+        packed_indices = gt_idx_Bl[-1]  # Use the finest scale
+        H = W = int(packed_indices.shape[1] ** 0.5)  # Assume square
+        
+        # Reshape packed indices back to spatial format [B, H, W]
+        indices_spatial = packed_indices.reshape(B, H, W)
+        
+        # Convert indices to continuous features using FSQ
+        quant = self.fsq.indices_to_codes(indices_spatial, project_out=True)
+        
+        # Reshape to [B, L, C] format expected by VAR
+        B, C, H, W = quant.shape
+        quant_BLC = quant.permute(0, 2, 3, 1).reshape(B, H * W, C)
+        
+        return quant_BLC
 
     def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
         """
