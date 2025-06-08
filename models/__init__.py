@@ -29,7 +29,7 @@ def build_vae_var(
         in_channel=3,
         channel=ch,
         z_channels=Cvae,
-        levels=[8, 5, 5, 5],
+        levels=[8, 8, 8, 5, 5, 5],
     ).to(device)
     var_wo_ddp = VAR(
         vae_local=vae_local,

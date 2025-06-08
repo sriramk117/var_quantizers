@@ -176,7 +176,28 @@ class VQVAE(nn.Module):
         """
         Decodes a 2D tensor of FSQ indices back into an image.
         """
+        # ---- START DEBUG ----
+        print(f"[VQVAE.indices_to_img] self.fsq.dim: {self.fsq.dim}")
+        print(f"[VQVAE.indices_to_img] self.fsq.num_codebooks: {self.fsq.num_codebooks}")
+        print(f"[VQVAE.indices_to_img] self.fsq.project_out: {self.fsq.project_out}")
+        print(f"[VQVAE.indices_to_img] input indices shape: {indices.shape}")
+        # ---- END DEBUG ----
         quant = self.fsq.indices_to_codes(indices, project_out=True)
+        # ---- START DEBUG ----
+        print(f"[VQVAE.indices_to_img] quant shape after fsq.indices_to_codes: {quant.shape}")
+        # ---- END DEBUG ----
+        
+        # Reshape quant from [B, L, C] to [B, C, H, W]
+        # Assuming L = H * W, and H = W (square feature map)
+        B, L, C = quant.shape
+        H = W = int(L**0.5) # Calculate H and W, assuming square
+        if H * W != L:
+            raise ValueError(f"Cannot reshape [B, L, C] to [B, C, H, W] when L ({L}) is not a perfect square.")
+        quant = quant.permute(0, 2, 1).reshape(B, C, H, W)
+        # ---- START DEBUG ----
+        print(f"[VQVAE.indices_to_img] quant shape after reshape: {quant.shape}")
+        # ---- END DEBUG ----
+
         dec = self.dec(quant)
         return dec.clamp(-1, 1)
 
