@@ -58,9 +58,9 @@ class Decoder(nn.Module):
     def __init__(self, args):
         super().__init__()
         print("INSIDE DECODER LAKSJDKLSDJFKLJSADKLJASKLDJF")
-        in_channel=args.embed_dim
-        out_channel=args.in_channel
-        channel=args.channel
+        in_channel=args['embed_dim']
+        out_channel=args['in_channel']
+        channel=args['channel']
         
         blocks = [
             nn.ConvTranspose2d(in_channel, channel, 4, stride=2, padding=1),
@@ -110,7 +110,8 @@ class VQVAE(nn.Module):
         # We name it 'fsq' for clarity, and handle the key mapping in load_state_dict.
         self.fsq = FSQ(levels=levels, dim=z_channels)
         
-        self.dec = Decoder({z_channels, in_channel, channel})
+        embed_dim = z_channels
+        self.dec = Decoder({"embed_dim": embed_dim, "in_channel": in_channel, "channel": channel})
         
         # The total number of unique codes in the codebook.
         self.vocab_size = self.fsq.codebook_size
@@ -205,8 +206,8 @@ class VQVAE(nn.Module):
         Decodes a 2D tensor of FSQ indices back into an image.
         """
         quant = self.fsq.indices_to_codes(indices, project_out=True)
-        print(self.fsq.implicit_codebook)
         dec = self.dec(quant)
+        print(dec)
         return dec.clamp(-1, 1)
 
     @torch.no_grad()
