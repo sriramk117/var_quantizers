@@ -33,22 +33,50 @@ class Encoder(nn.Module):
         return self.blocks(input)
 
 
+# class Decoder(nn.Module):
+#     """
+#     A simple convolutional decoder that matches the architecture from
+#     the repository where the FSQ checkpoint was trained.
+#     """
+#     def __init__(self, in_channel, out_channel, channel):
+#         super().__init__()
+#         blocks = [
+#             nn.ConvTranspose2d(in_channel, channel, 4, stride=2, padding=1),
+#             nn.ReLU(inplace=True),
+#             nn.ConvTranspose2d(channel, channel, 4, stride=2, padding=1),
+#             nn.ReLU(inplace=True),
+#             nn.ConvTranspose2d(channel, channel, 4, stride=2, padding=1),
+#             nn.ReLU(inplace=True),
+#             nn.Conv2d(channel, out_channel, 1)
+#         ]
+#         self.blocks = nn.Sequential(*blocks)
+
+#     def forward(self, input):
+#         return self.blocks(input)
+
 class Decoder(nn.Module):
-    """
-    A simple convolutional decoder that matches the architecture from
-    the repository where the FSQ checkpoint was trained.
-    """
-    def __init__(self, in_channel, out_channel, channel):
+    def __init__(self, args):
         super().__init__()
+        print("INSIDE DECODER LAKSJDKLSDJFKLJSADKLJASKLDJF")
+        in_channel=args.embed_dim
+        out_channel=args.in_channel
+        channel=args.channel
+        
         blocks = [
             nn.ConvTranspose2d(in_channel, channel, 4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(channel, channel, 4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(channel, channel, 4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channel, out_channel, 1)
         ]
+        blocks.append(nn.ReLU(inplace=True))
+        blocks.extend(
+                [
+                    nn.ConvTranspose2d(channel, channel, 4, stride=2, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.ConvTranspose2d(
+                        channel, channel, 4, stride=2, padding=1
+                    ),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(channel, out_channel, 1)
+                ]
+            )
         self.blocks = nn.Sequential(*blocks)
 
     def forward(self, input):
@@ -82,7 +110,7 @@ class VQVAE(nn.Module):
         # We name it 'fsq' for clarity, and handle the key mapping in load_state_dict.
         self.fsq = FSQ(levels=levels, dim=z_channels)
         
-        self.dec = Decoder(z_channels, in_channel, channel)
+        self.dec = Decoder({z_channels, in_channel, channel})
         
         # The total number of unique codes in the codebook.
         self.vocab_size = self.fsq.codebook_size
@@ -176,28 +204,8 @@ class VQVAE(nn.Module):
         """
         Decodes a 2D tensor of FSQ indices back into an image.
         """
-        # ---- START DEBUG ----
-        print(f"[VQVAE.indices_to_img] self.fsq.dim: {self.fsq.dim}")
-        print(f"[VQVAE.indices_to_img] self.fsq.num_codebooks: {self.fsq.num_codebooks}")
-        print(f"[VQVAE.indices_to_img] self.fsq.project_out: {self.fsq.project_out}")
-        print(f"[VQVAE.indices_to_img] input indices shape: {indices.shape}")
-        # ---- END DEBUG ----
         quant = self.fsq.indices_to_codes(indices, project_out=True)
-        # ---- START DEBUG ----
-        print(f"[VQVAE.indices_to_img] quant shape after fsq.indices_to_codes: {quant.shape}")
-        # ---- END DEBUG ----
-        
-        # Reshape quant from [B, L, C] to [B, C, H, W]
-        # Assuming L = H * W, and H = W (square feature map)
-        B, L, C = quant.shape
-        H = W = int(L**0.5) # Calculate H and W, assuming square
-        if H * W != L:
-            raise ValueError(f"Cannot reshape [B, L, C] to [B, C, H, W] when L ({L}) is not a perfect square.")
-        quant = quant.permute(0, 2, 1).reshape(B, C, H, W)
-        # ---- START DEBUG ----
-        print(f"[VQVAE.indices_to_img] quant shape after reshape: {quant.shape}")
-        # ---- END DEBUG ----
-
+        print(self.fsq.implicit_codebook)
         dec = self.dec(quant)
         return dec.clamp(-1, 1)
 
