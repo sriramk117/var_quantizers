@@ -25,7 +25,12 @@ def build_vae_var(
         setattr(clz, 'reset_parameters', lambda self: None)
     
     # build models
-    vae_local = VQVAE(vocab_size=V, z_channels=Cvae, ch=ch, test_mode=True, share_quant_resi=share_quant_resi, v_patch_nums=patch_nums).to(device)
+    vae_local = VQVAE(
+        in_channel=3,
+        channel=ch,
+        z_channels=Cvae,
+        levels=[8, 5, 5, 5],
+    ).to(device)
     var_wo_ddp = VAR(
         vae_local=vae_local,
         num_classes=num_classes, depth=depth, embed_dim=width, num_heads=heads, drop_rate=0., attn_drop_rate=0., drop_path_rate=dpr,
